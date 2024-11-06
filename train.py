@@ -16,8 +16,11 @@ from tqdm import tqdm
 import wandb
 from evaluate import evaluate
 from unet import UNet
+from unet.unet_model import UNet_Small
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
+from unified_focal_loss import AsymmetricUnifiedFocalLoss
+from utils.early_stopper import EarlyStopper
 
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
@@ -28,14 +31,14 @@ def train_model(
         model,
         device,
         epochs: int = 5,
-        batch_size: int = 1,
+        batch_size: int = 32,
         learning_rate: float = 1e-5,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
-        weight_decay: float = 1e-8,
-        momentum: float = 0.999,
+        weight_decay: float = 1e-4,
+        momentum: float = 0.9,
         gradient_clipping: float = 1.0,
 ):
     # 1. Create dataset
@@ -71,14 +74,24 @@ def train_model(
         Device:          {device.type}
         Images scaling:  {img_scale}
         Mixed Precision: {amp}
+        Momemntum:       {momentum}
+        Weight Decay:    {weight_decay}
     ''')
 
-    # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
+    # 4. Set up the optimizer, the loss, the learning rate scheduler, early stopper, and the loss scaling for AMP
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    early_stopper = EarlyStopper(patience = 3, min_delta = 1e-3)
+    # criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    #Use Unified Focal Loss 
+    criterion = AsymmetricUnifiedFocalLoss(
+        delta=0.7,
+        gamma=0.5,
+        ignore_index=2,
+    )
+
     global_step = 0
 
     # 5. Begin training
@@ -99,16 +112,7 @@ def train_model(
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
-                    else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+                    loss = criterion(F.softmax(masks_pred, dim=1), true_masks)
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -140,6 +144,8 @@ def train_model(
                                 histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
                         val_score = evaluate(model, val_loader, device, amp)
+                        if early_stopper(val_score):
+                            break
                         scheduler.step(val_score)
 
                         logging.info('Validation Dice score: {}'.format(val_score))
@@ -164,6 +170,7 @@ def train_model(
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+            torch.save(state_dict, str(dir_checkpoint / 'MODEL.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
 
@@ -194,7 +201,7 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet_Small(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
