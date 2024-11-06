@@ -16,7 +16,7 @@ from tqdm import tqdm
 import wandb
 from evaluate import evaluate
 from unet import UNet
-from unet.unet_model import UNet_Small
+from unet.unet_model import UNet_Small, UNet_3Layer
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 from unified_focal_loss import AsymmetricUnifiedFocalLoss
@@ -32,6 +32,7 @@ def train_model(
         device,
         epochs: int = 5,
         batch_size: int = 32,
+        save_frequency: int = 1,
         learning_rate: float = 1e-5,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
@@ -67,6 +68,7 @@ def train_model(
     logging.info(f'''Starting training:
         Epochs:          {epochs}
         Batch size:      {batch_size}
+        Save Frequency:  {save_frequency}
         Learning rate:   {learning_rate}
         Training size:   {n_train}
         Validation size: {n_val}
@@ -83,7 +85,7 @@ def train_model(
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    early_stopper = EarlyStopper(patience = 3, min_delta = 1e-3)
+    early_stopper = EarlyStopper(patience = 10, min_delta = 1e-3)
     # criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     #Use Unified Focal Loss 
     criterion = AsymmetricUnifiedFocalLoss(
@@ -101,7 +103,6 @@ def train_model(
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
-
                 assert images.shape[1] == model.n_channels, \
                     f'Network has been defined with {model.n_channels} input channels, ' \
                     f'but loaded images have {images.shape[1]} channels. Please check that ' \
@@ -144,8 +145,6 @@ def train_model(
                                 histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
                         val_score = evaluate(model, val_loader, device, amp)
-                        if early_stopper(val_score):
-                            break
                         scheduler.step(val_score)
 
                         logging.info('Validation Dice score: {}'.format(val_score))
@@ -169,9 +168,10 @@ def train_model(
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+            if (epoch%save_frequency == 0):
+                torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+                logging.info(f'Checkpoint {epoch} saved!')
             torch.save(state_dict, str(dir_checkpoint / 'MODEL.pth'.format(epoch)))
-            logging.info(f'Checkpoint {epoch} saved!')
 
 
 def get_args():
@@ -180,6 +180,8 @@ def get_args():
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
+    parser.add_argument('--save_freq', '-q', metavar='SF', type=int, default=1,
+                    help='Save Frequency', dest='SF')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
@@ -201,7 +203,7 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet_Small(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet_3Layer(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
@@ -221,6 +223,7 @@ if __name__ == '__main__':
             model=model,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            save_frequency=args.SF,
             learning_rate=args.lr,
             device=device,
             img_scale=args.scale,
@@ -237,6 +240,7 @@ if __name__ == '__main__':
             model=model,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            save_frequency=args.SF,
             learning_rate=args.lr,
             device=device,
             img_scale=args.scale,
