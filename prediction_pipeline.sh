@@ -6,3 +6,4 @@ for file in data/test/*; do
         python predict.py -m "./checkpoints/MODEL.pth" -i "./$file" -o "data/test_output/$filename"
     fi
 done
+echo "Done processing"

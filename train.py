@@ -22,8 +22,8 @@ from utils.dice_score import dice_loss
 from unified_focal_loss import AsymmetricUnifiedFocalLoss
 from utils.early_stopper import EarlyStopper
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
+dir_img = Path('./data/train/imgs/')
+dir_mask = Path('./data/train/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 
@@ -212,7 +212,7 @@ if __name__ == '__main__':
                  f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')
 
     if args.load:
-        state_dict = torch.load(args.load, map_location=device)
+        state_dict = torch.load(args.load, map_location=device, weights_only=True)
         del state_dict['mask_values']
         model.load_state_dict(state_dict)
         logging.info(f'Model loaded from {args.load}')
